@@ -2196,6 +2196,10 @@ mod cass_query_tests {
             CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)?;
         index.add_cass_documents(&[
             replacement_document("local", 1, "obsoleteword"),
+            CassDocument {
+                msg_idx: 1,
+                ..replacement_document("local", 1, "previousword")
+            },
             replacement_document("remote", 1, "neighborword"),
             replacement_document("local", 2, "neighborword"),
         ])?;
@@ -2206,15 +2210,31 @@ mod cass_query_tests {
         index.replace_cass_conversation(
             "local",
             1,
-            &[replacement_document("local", 1, "currentword")],
+            &[
+                replacement_document("local", 1, "currentword"),
+                CassDocument {
+                    msg_idx: 1,
+                    ..replacement_document("local", 1, "secondword")
+                },
+                CassDocument {
+                    msg_idx: 2,
+                    ..replacement_document("local", 1, "thirdword")
+                },
+            ],
         )?;
         reader.reload()?;
         assert_eq!(replacement_matches(&reader, &fields, "obsoleteword")?, 1); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
         assert_eq!(replacement_matches(&reader, &fields, "currentword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "previousword")?, 1); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "secondword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "thirdword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
         index.commit()?;
         reader.reload()?;
         assert_eq!(replacement_matches(&reader, &fields, "obsoleteword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
         assert_eq!(replacement_matches(&reader, &fields, "currentword")?, 1); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "previousword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "secondword")?, 1); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "thirdword")?, 1); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
         assert_eq!(replacement_matches(&reader, &fields, "neighborword")?, 2); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
         index.replace_cass_conversation("local", 1, &[])?;
         index.commit()?;
@@ -2225,6 +2245,8 @@ mod cass_query_tests {
         let reader = reopened.reader()?;
         reader.reload()?;
         assert_eq!(replacement_matches(&reader, &fields, "currentword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "secondword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "thirdword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
         assert_eq!(replacement_matches(&reader, &fields, "neighborword")?, 2); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
         Ok(())
     }
