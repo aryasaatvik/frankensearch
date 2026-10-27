@@ -21,10 +21,9 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
 use tracing::{debug, info, warn};
 
 /// Schema version namespace used for cass-compatible Tantivy indexes.
-pub const CASS_SCHEMA_VERSION: &str = "v8";
+pub const CASS_SCHEMA_VERSION: &str = "v9";
 /// Content hash used to detect schema/tokenizer changes that require rebuild.
-pub const CASS_SCHEMA_HASH: &str =
-    "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
+pub const CASS_SCHEMA_HASH: &str = "tantivy-schema-v9-source-conversation-replacement";
 
 /// Specialized tokenizer for cass lexical fields.
 ///
@@ -583,6 +582,7 @@ pub struct CassFields {
     pub origin_kind: Field,
     pub origin_host: Field,
     pub conversation_id: Option<Field>,
+    pub conversation_key: Field,
 }
 
 /// Merge status for cass-compatible Tantivy segment optimization.
@@ -856,6 +856,51 @@ impl CassTantivyIndex {
         Ok(())
     }
 
+    /// Queue replacement of exactly one source's conversation.
+    ///
+    /// The delete and additions share one operation group. Readers see the old
+    /// generation until [`Self::commit`], then the complete replacement. An empty
+    /// document slice removes that conversation. Identity validation precedes
+    /// every writer operation, so rejected input leaves pending writes intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] for empty sources, nonpositive IDs,
+    /// or documents outside the requested scope, and a subsystem error if the
+    /// writer cannot accept the operation group.
+    pub fn replace_cass_conversation(
+        &mut self,
+        source_id: &str,
+        conversation_id: i64,
+        docs: &[CassDocument],
+    ) -> SearchResult<()> {
+        if source_id.is_empty()
+            || conversation_id <= 0
+            || docs.iter().any(|document| {
+                document.source_id != source_id || document.conversation_id != Some(conversation_id)
+            })
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "conversation_identity".to_owned(),
+                value: format!("{source_id}:{conversation_id}"),
+                reason: "replacement requires a nonempty source, positive conversation ID, and matching document identities".to_owned(),
+            });
+        }
+        let term = Term::from_field_text(
+            self.fields.conversation_key,
+            &cass_conversation_key(source_id, conversation_id),
+        );
+        let operations: Vec<_> = std::iter::once(UserOperation::Delete(term))
+            .chain(
+                docs.iter()
+                    .map(|document| build_cass_tantivy_document(self.fields, document))
+                    .map(UserOperation::Add),
+            )
+            .collect();
+        self.writer.run(operations).map_err(tantivy_err)?;
+        Ok(())
+    }
+
     /// Commit all pending writer operations.
     ///
     /// # Errors
@@ -1098,6 +1143,10 @@ impl CassTantivyIndex {
     }
 }
 
+fn cass_conversation_key(source_id: &str, conversation_id: i64) -> String {
+    format!("{}:{source_id}:{conversation_id}", source_id.len())
+}
+
 /// Build a single `TantivyDocument` for a cass document. Pure function so it
 /// can run on any rayon worker.
 fn build_cass_tantivy_document(
@@ -1122,6 +1171,10 @@ fn build_cass_tantivy_document(
         && let Some(conversation_id) = cass_doc.conversation_id
     {
         d.add_i64(field, conversation_id);
+        d.add_text(
+            fields.conversation_key,
+            cass_conversation_key(&cass_doc.source_id, conversation_id),
+        );
     }
     if let Some(workspace) = &cass_doc.workspace {
         d.add_text(fields.workspace, workspace);
@@ -1164,6 +1217,10 @@ fn build_cass_tantivy_document_ref(
         && let Some(conversation_id) = cass_doc.conversation_id
     {
         d.add_i64(field, conversation_id);
+        d.add_text(
+            fields.conversation_key,
+            cass_conversation_key(cass_doc.source_id, conversation_id),
+        );
     }
     if let Some(workspace) = cass_doc.workspace {
         d.add_text(fields.workspace, workspace);
@@ -1214,7 +1271,8 @@ pub fn cass_build_schema() -> Schema {
     schema_builder.add_text_field("source_id", STRING | STORED);
     schema_builder.add_text_field("origin_kind", STRING | STORED);
     schema_builder.add_text_field("origin_host", STRING | STORED);
-    schema_builder.add_i64_field("conversation_id", STORED);
+    schema_builder.add_i64_field("conversation_id", INDEXED | STORED);
+    schema_builder.add_text_field("conversation_key", STRING);
     schema_builder.build()
 }
 
@@ -1250,6 +1308,7 @@ pub fn cass_fields_from_schema(schema: &Schema) -> SearchResult<CassFields> {
         origin_kind: get("origin_kind")?,
         origin_host: get("origin_host")?,
         conversation_id: schema.get_field("conversation_id").ok(),
+        conversation_key: get("conversation_key")?,
     })
 }
 
@@ -2099,6 +2158,133 @@ pub fn cass_build_tantivy_query(
 #[cfg(test)]
 mod cass_query_tests {
     use super::*;
+
+    fn replacement_document(source: &str, conversation: i64, content: &str) -> CassDocument {
+        CassDocument {
+            agent: "t3".to_owned(),
+            workspace: None,
+            workspace_original: None,
+            source_path: "/test/statev2.sqlite/thread".to_owned(),
+            msg_idx: 0,
+            created_at: None,
+            title: None,
+            content: content.to_owned(),
+            source_id: source.to_owned(),
+            origin_kind: "local".to_owned(),
+            origin_host: None,
+            conversation_id: Some(conversation),
+        }
+    }
+
+    fn replacement_matches(
+        reader: &IndexReader,
+        fields: &CassFields,
+        text: &str,
+    ) -> SearchResult<usize> {
+        let query = cass_build_tantivy_query(text, &CassQueryFilters::default(), fields);
+        reader
+            .searcher()
+            .search(&query, &tantivy::collector::Count)
+            .map_err(tantivy_err)
+    }
+
+    #[test]
+    fn conversation_replacement_is_commit_atomic_and_source_scoped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)?;
+        index.add_cass_documents(&[
+            replacement_document("local", 1, "obsoleteword"),
+            CassDocument {
+                msg_idx: 1,
+                ..replacement_document("local", 1, "previousword")
+            },
+            replacement_document("remote", 1, "neighborword"),
+            replacement_document("local", 2, "neighborword"),
+        ])?;
+        index.commit()?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let fields = index.fields();
+        index.replace_cass_conversation(
+            "local",
+            1,
+            &[
+                replacement_document("local", 1, "currentword"),
+                CassDocument {
+                    msg_idx: 1,
+                    ..replacement_document("local", 1, "secondword")
+                },
+                CassDocument {
+                    msg_idx: 2,
+                    ..replacement_document("local", 1, "thirdword")
+                },
+            ],
+        )?;
+        reader.reload()?;
+        assert_eq!(replacement_matches(&reader, &fields, "obsoleteword")?, 1); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "currentword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "previousword")?, 1); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "secondword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "thirdword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        index.commit()?;
+        reader.reload()?;
+        assert_eq!(replacement_matches(&reader, &fields, "obsoleteword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "currentword")?, 1); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "previousword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "secondword")?, 1); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "thirdword")?, 1); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "neighborword")?, 2); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        index.replace_cass_conversation("local", 1, &[])?;
+        index.commit()?;
+        drop(reader);
+        drop(index);
+        let reopened =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)?;
+        let reader = reopened.reader()?;
+        reader.reload()?;
+        assert_eq!(replacement_matches(&reader, &fields, "currentword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "secondword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "thirdword")?, 0); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        assert_eq!(replacement_matches(&reader, &fields, "neighborword")?, 2); // ubs:ignore[rust.panic.assert-macros] -- regression assertion
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_replacement_rejects_mismatches_before_mutating_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)?;
+        index.add_cass_documents(&[replacement_document("local", 1, "preservedword")])?;
+        for (source, id, document) in [
+            ("local", 1, replacement_document("remote", 1, "wrongword")),
+            ("local", 1, replacement_document("local", 2, "wrongword")),
+            ("", 1, replacement_document("", 1, "wrongword")),
+            ("local", 0, replacement_document("local", 0, "wrongword")),
+        ] {
+            // ubs:ignore[rust.panic.assert-macros] -- rejected-input regression assertion
+            assert!(matches!(
+                index.replace_cass_conversation(source, id, &[document]),
+                Err(SearchError::InvalidConfig { .. })
+            ));
+        }
+        index.commit()?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        // ubs:ignore[rust.panic.assert-macros] -- existing data must survive a rejected replacement
+        assert_eq!(
+            replacement_matches(&reader, &index.fields(), "preservedword")?,
+            1
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- invalid replacement must add no data
+        assert_eq!(
+            replacement_matches(&reader, &index.fields(), "wrongword")?,
+            0
+        );
+        Ok(())
+    }
 
     fn fields() -> CassFields {
         let schema = cass_build_schema();
